@@ -1,29 +1,31 @@
 package com.benny.library.statechart
 
+import org.jetbrains.annotations.TestOnly
 import java.lang.reflect.Method
 import java.lang.reflect.Modifier
 
 open class Event
 open class Reason
 
-internal interface EventDispatcher {
-    fun sendEvent(event: Event)
-}
-
 open class State<Param: Any, Context: Any>(internal val name: String) {
     private var exiting = false
 
     @Volatile
-    private var context: Context? = null
-    @Volatile
-    internal var eventDispatcher: EventDispatcher? = null
+    private var _context: Context? = null
+    private var stateChart: StateChart? = null
+
+    @TestOnly
+    internal fun stateChart() = stateChart
+
     // get event handle method use reflection
-    // 1. public
-    // 2. only one parameter and type should be inherit from Event
-    // 3. return boolean
+    // 1. with HandleEvent annotation
+    // 2. public
+    // 3. only one parameter and type should be inherit from Event
+    // 4. return boolean
     private val eventHandlers: Map<Class<Event>, Method> by lazy {
         javaClass.declaredMethods.filter {
-            Modifier.isPublic(it.modifiers)
+            it.getDeclaredAnnotation(HandleEvent::class.java) != null
+                    && Modifier.isPublic(it.modifiers)
                     && it.parameterCount == 1
                     && Event::class.java.isAssignableFrom(it.parameterTypes.first())
                     && it.returnType == Boolean::class.java
@@ -34,9 +36,9 @@ open class State<Param: Any, Context: Any>(internal val name: String) {
     }
 
     @Suppress("UNCHECKED_CAST")
-    internal open fun enter(dispatcher: EventDispatcher, param: Any, context: Any) {
-        this.eventDispatcher = dispatcher
-        this.context = context as Context
+    internal open fun enter(stateChart: StateChart, param: Any, context: Any) {
+        this.stateChart = stateChart
+        this._context = context as Context
         onEnter(param as Param)
     }
 
@@ -44,13 +46,13 @@ open class State<Param: Any, Context: Any>(internal val name: String) {
         exiting = true
 
         onExit(reason)
-        this.context = null
-        this.eventDispatcher = null
+        this._context = null
+        this.stateChart = null
 
         exiting = false
     }
 
-    internal fun handleEvent(event: Event): Boolean {
+    internal open fun handleEvent(event: Event): Boolean {
         return eventHandlers[event.javaClass]?.invoke(this, event) as? Boolean
             ?: false
     }
@@ -59,15 +61,17 @@ open class State<Param: Any, Context: Any>(internal val name: String) {
         check(!exiting) {
             "can't send event[$event] when state exiting!"
         }
-        eventDispatcher?.sendEvent(event)
+        stateChart?.sendEvent(event)
     }
 
     protected open fun onEnter(param: Param) { }
     protected open fun onExit(reason: Reason) { }
 
+    val context: Context get() = _context as Context
+
     @Suppress("UNCHECKED_CAST")
     fun <T: Context> contextAs(): T {
-        return context as T
+        return _context as T
     }
 
     override fun toString(): String {
@@ -90,17 +94,24 @@ open class SubState<Param: Any, Context: Any, SubContext: Any>(
 
     private var subChart: StateChart? = null
 
+    @TestOnly
+    internal fun subChart() = subChart
+
     @Suppress("UNCHECKED_CAST")
-    override fun enter(dispatcher: EventDispatcher, param: Any, context: Any) {
+    override fun enter(stateChart: StateChart, param: Any, context: Any) {
         subChart = subChartBuilderFactory({ param as Param }, {context as Context}).build()
-        subChart?.onDiscardEvent = { discardEvent ->
-            // when sub chart can not handle this event, dispatch it to parent chart
-            dispatcher.sendEvent(discardEvent)
-        }
+        subChart?.parent = stateChart
         // subState should send event to subChart firstly
         super.enter(subChart!!, param, context)
-        // parent state end, then sub chart state
+        // parent state enter, then sub chart state
         subChart?.run()
+    }
+
+    override fun handleEvent(event: Event): Boolean {
+        if (!super.handleEvent(event)) {
+            return subChart!!.enqueueEvent(event)
+        }
+        return true
     }
 
     override fun exit(reason: Reason) {

@@ -18,15 +18,15 @@ internal class Transition<T: Any, EV: Event, Context: Any> (
     val from: Set<State<*, Context>>,
     val to: State<T, Context>,
     val eventClass: Class<EV>,
-    private val condition: (EV, Context) -> Result<T>
+    private val condition: (EV, State<*, Context>, Context) -> Result<T>
 ) {
     fun transit(event: Event, state: State<*, *>, context: Any): Result<T> {
-        if (!from.contains(state) || event.javaClass != eventClass) {
+        if (event.javaClass != eventClass) {
             return Result.Disallow()
         }
 
         @Suppress("UNCHECKED_CAST")
-        return condition(event as EV, context as Context)
+        return condition(event as EV, state as State<*, Context>, context as Context)
     }
 
     override fun toString(): String {

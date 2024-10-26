@@ -1,5 +1,6 @@
 package com.benny.library.statechart
 
+import org.jetbrains.annotations.TestOnly
 import java.util.LinkedList
 
 fun interface EventLogger {
@@ -11,8 +12,8 @@ class StateChart private constructor(
   private val contextFactory: ()->Any,
   private val eventLogger: EventLogger,
   private val states: Set<State<*, *>>,
-  private val transitions: Map<Class<out Event>, Transition<*, *, *>>,
-): EventDispatcher {
+  private val transitions: Map<Class<out Event>, List<Transition<*, *, *>>>,
+) {
   private object Uninitialized : State<Unit, Any>("Uninitialized")
 
   private class Init: Event()
@@ -27,10 +28,13 @@ class StateChart private constructor(
   private var processingEvent = false
   private val eventQueue = LinkedList<Event>()
 
+  internal var parent: StateChart? = null
+
   internal lateinit var context: Any
   private var currentState: State<*, *> = Uninitialized
 
-  internal var onDiscardEvent: (Event) -> Unit = { }
+  @TestOnly
+  internal fun state() = currentState
 
   private fun checkThread() {
     check(thread == Thread.currentThread()) {
@@ -60,14 +64,79 @@ class StateChart private constructor(
     }
   }
 
-  override fun sendEvent(event: Event) {
+  fun sendEvent(event: Event): Boolean {
     checkThread()
 
     check (lifecycle == Lifecycle.Running) {
       "StateChart[$name] not initialized, call run first"
     }
 
-    enqueueEvent(event, onDiscardEvent)
+    return if (event is Init) {
+      // Init should always handled by self
+      enqueueEvent(event)
+    } else {
+      parent?.sendEvent(event) ?: enqueueEvent(event)
+    }
+  }
+
+  internal fun enqueueEvent(event: Event): Boolean {
+    eventLogger.logEvent("StateChart[$name] send event: ${event.javaClass.simpleName}")
+
+    var processed = false
+
+    if (!processingEvent) {
+      processingEvent = true
+
+      eventQueue.add(event)
+
+      do {
+        val nextEvent = eventQueue.pollFirst()!!
+
+        if (currentState.handleEvent(nextEvent)) {
+          if (event == nextEvent) {
+            processed = true
+          }
+
+          // current state consume first
+          eventLogger.logEvent("StateChart[$name] event: ${nextEvent.javaClass.simpleName} handled by $currentState")
+          continue;
+        }
+
+        // if current state does not consume, find match transition
+        val transition = transitions[nextEvent.javaClass]?.find {
+          it.from.contains(currentState)
+        }
+
+        if (transition == null) {
+          eventLogger.logEvent("StateChart[$name] event: ${nextEvent.javaClass.simpleName} discard")
+          continue
+        }
+
+        val result = transition.transit(nextEvent, currentState, context)
+        if (result is Result.Allow) {
+          val state = transition.to
+          eventLogger.logEvent("StateChart[$name] transition[$transition] from $currentState to $state")
+
+          currentState.exit(result.reason)
+          state.enter(this, result.param, context)
+
+          currentState = state
+
+          if (event == nextEvent) {
+            processed = true
+          }
+        } else {
+          eventLogger.logEvent("StateChart[$name] event: $nextEvent disallowed")
+        }
+      }
+      while (eventQueue.isNotEmpty())
+
+      processingEvent = false
+    } else {
+      eventQueue.addLast(event)
+    }
+
+    return processed
   }
 
   /**
@@ -92,7 +161,7 @@ class StateChart private constructor(
       }
 
       val toStateMap = mutableMapOf<State<*, *>, MutableList<String>>()
-      transitions.values.filter { it.from.contains(state) }.forEach { transition ->
+      transitions.values.flatten().filter { it.from.contains(state) }.forEach { transition ->
         toStateMap.getOrPut(transition.to) {
           mutableListOf()
         }.add("${transition.name}(${transition.eventClass.simpleName})")
@@ -108,59 +177,12 @@ class StateChart private constructor(
     return umlBuilder.toString()
   }
 
-  internal fun enqueueEvent(event: Event, onDiscard: (Event)->Unit) {
-    eventLogger.logEvent("StateChart[$name] send event: ${event.javaClass.simpleName}")
-
-    if (!processingEvent) {
-      processingEvent = true
-
-      eventQueue.add(event)
-
-      do {
-        val nextEvent = eventQueue.pollFirst()!!
-
-        if (currentState.handleEvent(nextEvent)) {
-          // current state consume first
-          eventLogger.logEvent("StateChart[$name] event: ${nextEvent.javaClass.simpleName} handled by $currentState")
-          continue;
-        }
-
-        // if current state does not consume, find match transition
-        val transition = transitions[nextEvent.javaClass]
-        if (transition == null) {
-          eventLogger.logEvent("StateChart[$name] event: ${nextEvent.javaClass.simpleName} discard")
-          // no transition found for this event, notify outside, dispatch to parent if exist
-          onDiscard(nextEvent)
-          continue
-        }
-
-        val result = transition.transit(nextEvent, currentState, context)
-        if (result is Result.Allow) {
-          val state = transition.to
-          eventLogger.logEvent("StateChart[$name] transition[$transition] from $currentState to $state")
-
-          currentState.exit(result.reason)
-          state.enter(this, result.param, context)
-
-          currentState = state
-        } else {
-          eventLogger.logEvent("StateChart[$name] event: $nextEvent disallowed")
-        }
-      }
-      while (eventQueue.isNotEmpty())
-
-      processingEvent = false
-    } else {
-      eventQueue.addLast(event)
-    }
-  }
-
   class Builder<Context: Any>(private val name: String) {
     private val states = LinkedHashSet<State<*, *>>()
 
     private var eventLogger: EventLogger = EventLogger { }
     private var contextFactory: (()->Context)? = null
-    private val transitions = LinkedHashMap<Class<out Event>, Transition<*, *, out Any>>()
+    private val transitions = LinkedHashMap<Class<out Event>, MutableList<Transition<*, *, out Any>>>()
 
     fun eventLogger(logger: EventLogger): Builder<Context> = apply {
       this.eventLogger = logger
@@ -184,14 +206,16 @@ class StateChart private constructor(
       states.add(state)
 
       @Suppress("UNCHECKED_CAST")
-      transitions[Init::class.java] = Transition(
-        "init",
-        setOf(Uninitialized as State<*, Context>),
-        state,
-        Init::class.java,
-      ) { _, _ ->
-        Result.Allow(defaultParam())
-      }
+      transitions[Init::class.java] = mutableListOf(
+        Transition(
+          "init",
+          setOf(Uninitialized as State<*, Context>),
+          state,
+          Init::class.java,
+        ) { _, _, _ ->
+          Result.Allow(defaultParam())
+        }
+      )
     }
 
     /**
@@ -228,7 +252,7 @@ class StateChart private constructor(
       from: Set<State<*, Context>>,
       to: State<T, Context>,
       event: Class<EV>,
-      condition: (EV, Context)-> Result<T>
+      condition: (EV, State<*, Context>, Context)-> Result<T>
     ): Builder<Context> = apply {
       from.forEach {
         check (states.contains(it)) {
@@ -236,7 +260,9 @@ class StateChart private constructor(
         }
       }
 
-      transitions[event] = Transition(name, from, to, event, condition)
+      transitions.getOrPut(event){
+        mutableListOf()
+      }.add(Transition(name, from, to, event, condition))
     }
 
     fun build(): StateChart {
