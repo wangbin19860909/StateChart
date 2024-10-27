@@ -8,7 +8,7 @@ fun interface EventLogger {
 }
 
 class StateChart private constructor(
-  internal val name: String,
+  private val name: String,
   private val contextFactory: ()->Any,
   private val eventLogger: EventLogger,
   private val states: Set<State<*, *>>,
@@ -25,8 +25,8 @@ class StateChart private constructor(
   private val thread = Thread.currentThread()
   private var lifecycle = Lifecycle.Init
 
-  private var processingEvent = false
-  private val eventQueue = LinkedList<Event>()
+  private var processingTask = false
+  private val taskQueue = LinkedList<()->Boolean>()
 
   internal var parent: StateChart? = null
 
@@ -51,7 +51,9 @@ class StateChart private constructor(
 
     lifecycle = Lifecycle.Running
     context = contextFactory.invoke()
-    sendEvent(Init())
+
+    // Init should always handled by self
+    enqueueEvent(Init())
   }
 
   fun release(reason: Reason) {
@@ -59,7 +61,7 @@ class StateChart private constructor(
 
     if (lifecycle == Lifecycle.Running) {
       currentState.exit(reason)
-      eventQueue.clear()
+      taskQueue.clear()
       lifecycle = Lifecycle.Released
     }
   }
@@ -71,71 +73,65 @@ class StateChart private constructor(
       "StateChart[$name] not initialized, call run first"
     }
 
-    return if (event is Init) {
-      // Init should always handled by self
-      enqueueEvent(event)
-    } else {
-      parent?.sendEvent(event) ?: enqueueEvent(event)
-    }
+    return parent?.sendEvent(event) ?: enqueueEvent(event)
   }
 
   internal fun enqueueEvent(event: Event): Boolean {
     eventLogger.logEvent("StateChart[$name] send event: ${event.javaClass.simpleName}")
 
+    return enqueueTask {
+      if (currentState.handleEvent(event)) {
+        // current state consume first
+        eventLogger.logEvent("StateChart[$name] event: ${event.javaClass.simpleName} handled by $currentState")
+        return@enqueueTask true
+      }
+
+      // if current state does not consume, find match transition
+      val transition = transitions[event.javaClass]?.find {
+        it.from.contains(currentState)
+      }
+
+      if (transition == null) {
+        eventLogger.logEvent("StateChart[$name] event: ${event.javaClass.simpleName} discard")
+        return@enqueueTask false
+      }
+
+      val result = transition.transit(event, currentState, context)
+      if (result is Result.Allow) {
+        val state = transition.to
+        eventLogger.logEvent("StateChart[$name] transition[$transition] from $currentState to $state")
+
+        currentState.exit(result.reason)
+        currentState._stateChart = null
+        state._stateChart = this
+        state.enter(result.param, context)
+        currentState = state
+
+        return@enqueueTask true
+      } else {
+        eventLogger.logEvent("StateChart[$name] event: $event disallowed")
+        return@enqueueTask false
+      }
+    }
+  }
+
+  private fun enqueueTask(task: ()->Boolean): Boolean {
+    taskQueue.offerLast(task)
+
     var processed = false
-
-    if (!processingEvent) {
-      processingEvent = true
-
-      eventQueue.add(event)
+    if (!processingTask) {
+      processingTask = true
 
       do {
-        val nextEvent = eventQueue.pollFirst()!!
-
-        if (currentState.handleEvent(nextEvent)) {
-          if (event == nextEvent) {
-            processed = true
-          }
-
-          // current state consume first
-          eventLogger.logEvent("StateChart[$name] event: ${nextEvent.javaClass.simpleName} handled by $currentState")
-          continue;
+        val nextTask = taskQueue.pollFirst()
+        val result = nextTask.invoke()
+        if (nextTask == task) {
+          processed = result
         }
+      } while (taskQueue.isNotEmpty())
 
-        // if current state does not consume, find match transition
-        val transition = transitions[nextEvent.javaClass]?.find {
-          it.from.contains(currentState)
-        }
-
-        if (transition == null) {
-          eventLogger.logEvent("StateChart[$name] event: ${nextEvent.javaClass.simpleName} discard")
-          continue
-        }
-
-        val result = transition.transit(nextEvent, currentState, context)
-        if (result is Result.Allow) {
-          val state = transition.to
-          eventLogger.logEvent("StateChart[$name] transition[$transition] from $currentState to $state")
-
-          currentState.exit(result.reason)
-          state.enter(this, result.param, context)
-
-          currentState = state
-
-          if (event == nextEvent) {
-            processed = true
-          }
-        } else {
-          eventLogger.logEvent("StateChart[$name] event: $nextEvent disallowed")
-        }
-      }
-      while (eventQueue.isNotEmpty())
-
-      processingEvent = false
-    } else {
-      eventQueue.addLast(event)
+      processingTask = false
     }
-
     return processed
   }
 
@@ -247,7 +243,7 @@ class StateChart private constructor(
      * @param condition transition should be done if return Result.Allow else not.
      *                  also convert event to state param in it
      */
-    fun <T: Any, EV: Event> transition(
+    fun <EV: Event, T: Any> transition(
       name: String,
       from: Set<State<*, Context>>,
       to: State<T, Context>,

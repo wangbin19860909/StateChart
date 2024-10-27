@@ -76,7 +76,15 @@ class SingleLayerStateChartTest {
                 Forbidden::class.java
             ) { _,_,_ ->
                 Result.Allow(5000)
-            }.build()
+            }.transition<Forbidden, Long>(
+                "yellow_to_green",
+                setOf(greenLight),
+                yellowLight,
+                Forbidden::class.java
+            ) { _,_,_ ->
+                Result.Disallow()
+            }
+            .build()
 
         println(stateChart.toUmlDiagram())
         stateChart.run()
