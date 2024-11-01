@@ -3,7 +3,6 @@ package com.benny.library.statechart
 import org.jetbrains.annotations.TestOnly
 import java.util.LinkedList
 
-
 class StateStack private constructor(
   private val name: String,
   private val contextFactory: () -> Any,
@@ -41,13 +40,6 @@ class StateStack private constructor(
   fun sendEvent(event: Event): Boolean {
     checkThread()
     return enqueueEvent(event)
-  }
-
-  fun pop() {
-    enqueueTask {
-      enteredStates.pollLast()?.exit(Reason.Default)
-      return@enqueueTask true
-    }
   }
 
   private fun enqueueEvent(event: Event): Boolean {

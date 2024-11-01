@@ -63,7 +63,7 @@ private val subB2 = object : State<Unit, Unit>("subB2") {
 // 3. build state chart
 val stateChart = StateChart.Builder<Unit>("Top")
     .eventLogger { println(it) }
-    .context { Unit }
+    .context { }
     .initialState(topA) {}
     .state(topB) { _,_ ->
         // sub state chart
