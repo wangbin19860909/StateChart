@@ -12,7 +12,7 @@ class StateStack private constructor(
   private val thread = Thread.currentThread()
 
   private val eventStates = mutableMapOf<Class<out Event>, State<*, *>>()
-  private val enteredStates = LinkedList<State<*, *>>()
+  private val enteredStates = ArrayList<State<*, *>>()
 
   @TestOnly
   internal fun isEntered(state: State<*, *>): Boolean {
@@ -46,7 +46,8 @@ class StateStack private constructor(
     eventLogger.logEvent("StateQueue[$name] send event: ${event.javaClass.simpleName}")
     return enqueueTask {
       // handle event first, but ignore return value
-      enteredStates.forEach {
+      // top state should handle firstly
+      enteredStates.asReversed().forEach {
         if (it.handleEvent(event)) {
           eventLogger.logEvent("StateQueue[$name] event: ${event.javaClass.simpleName} handled by $it")
           return@enqueueTask true
